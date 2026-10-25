@@ -62,7 +62,8 @@ CANDIDATAS_DEFECTO = ["Álava", "Bizkaia", "Gipuzkoa", "Cantabria", "Burgos",
                       "La Rioja", "Navarra", "Palencia"]
 
 RE_PRECIO = re.compile(r"^\d[\d\.]*\s*€$")
-INSIGNIAS = {"¡destacado!", "destacado", "negociable"}
+RE_PUEBLO_PROV = re.compile(r"^(.{2,60}?)\s*\(([^()]{2,30})\)\s*$")   # "Aller (Asturias)"
+INSIGNIAS = {"¡destacado!", "destacado", "negociable", "a convenir", "a consultar"}
 
 ALIAS_PROVINCIA = {
     "álava": {"alava", "araba"},
@@ -254,18 +255,17 @@ def _normaliza(a_tag, url):
         resto, _, region = ubicacion.rpartition(",")
         ciudad = resto.split(",")[0]      # "Vega de Pas, Vega de Pas" -> "Vega de Pas"
     else:
-        # Ubicación sin coma: solo provincia, o solo pueblo.
+        # Ubicación sin coma: "Pueblo (Provincia)" o solo "Provincia".
         # Se ignoran los textos repetidos del título.
         extras = [t for t in titulos[1:] if sin_acentos(t) != sin_acentos(titulos[0])]
         for t in extras:
+            m = RE_PUEBLO_PROV.match(t)
+            if m and sin_acentos(m.group(2)) in PROVINCIAS_CONOCIDAS:
+                ciudad, region = m.group(1), m.group(2)
+                break
             if sin_acentos(t) in PROVINCIAS_CONOCIDAS:
                 region = t
                 break
-        if not region:
-            for t in extras:
-                if len(t) <= 40 and len(t.split()) <= 5:
-                    ciudad = t
-                    break
     return {
         "id": url.rstrip("/").split("/")[-1],
         "titulo": titulos[0],
@@ -665,3 +665,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
