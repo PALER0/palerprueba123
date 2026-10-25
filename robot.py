@@ -21,10 +21,13 @@ import math
 import os
 import random
 import re
+import statistics
 import sys
 import time
 import unicodedata
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 
 import requests
@@ -33,6 +36,7 @@ from bs4 import BeautifulSoup
 
 ESTADO = Path("state/vistos.json")
 DIAS_GUARDAR = 60              # cuánto tiempo se recuerdan los anuncios vistos
+DIAS_HISTORIAL = 90            # cuánto tiempo se guarda el historial para estadísticas
 DIAS_REINTENTAR_GEO = 7        # cuándo reintentar un pueblo que no se encontró
 MAX_AVISOS_POR_EJECUCION = 20
 MAX_GEOCODIFICAR_POR_EJECUCION = 60
@@ -107,17 +111,42 @@ def cargar_estado():
             est = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         est = {}
-    est.setdefault("vistos", {})     # web -> {id: marca_de_tiempo}
+    # web -> {id: {"t": cuándo, "p": último precio, "d": 1 dentro / 0 fuera / None sin saber,
+    #              "k": km}}   (el formato antiguo era {id: marca_de_tiempo})
+    est.setdefault("vistos", {})
     est.setdefault("listos", [])     # "web|categoria" ya inicializadas
     est.setdefault("alertas", {})    # clave -> marca_de_tiempo
     est.setdefault("geo", {})        # "pueblo|provincia" -> {ok, lat, lon, t}
+    est.setdefault("historial", [])  # anuncios avisados: {id, c, p, d(fecha)}
+    est.setdefault("bajadas", [])    # fechas de los avisos de bajada de precio
+    est.setdefault("resumen", {})    # último resumen diario/semanal enviado
     return est
+
+
+def registro(vistos, ident):
+    """Devuelve el registro de un anuncio visto (convierte el formato antiguo)."""
+    reg = vistos.get(ident)
+    if reg is None:
+        return None
+    if not isinstance(reg, dict):
+        reg = {"t": reg, "p": None, "d": None, "k": None}
+        vistos[ident] = reg
+    return reg
+
+
+def ahora_madrid():
+    return datetime.now(ZoneInfo("Europe/Madrid"))
 
 
 def guardar_estado(est):
     limite = time.time() - DIAS_GUARDAR * 86400
     for web, ids in est["vistos"].items():
-        est["vistos"][web] = {i: t for i, t in ids.items() if t >= limite}
+        est["vistos"][web] = {
+            i: r for i, r in ids.items()
+            if (r["t"] if isinstance(r, dict) else r) >= limite}
+    corte = (ahora_madrid() - timedelta(days=DIAS_HISTORIAL)).strftime("%Y-%m-%d")
+    est["historial"] = [h for h in est["historial"] if h["d"] >= corte]
+    est["bajadas"] = [d for d in est["bajadas"] if d >= corte]
     ESTADO.parent.mkdir(parents=True, exist_ok=True)
     with open(ESTADO, "w", encoding="utf-8") as f:
         json.dump(est, f)
@@ -186,7 +215,7 @@ def alertar(est, clave, mensaje, horas=6):
     if time.time() - est["alertas"].get(clave, 0) < horas * 3600:
         return
     try:
-        telegram("⚠️ " + html.escape(mensaje))
+        telegram("⚠️ " + html.escape(mensaje, quote=False))
         est["alertas"][clave] = time.time()
     except Exception as e:  # noqa: BLE001
         log("No se pudo enviar la alerta:", e)
@@ -225,11 +254,18 @@ def _normaliza(a_tag, url):
         resto, _, region = ubicacion.rpartition(",")
         ciudad = resto.split(",")[0]      # "Vega de Pas, Vega de Pas" -> "Vega de Pas"
     else:
-        # Ubicación que solo trae la provincia (sin coma)
-        for t in titulos[1:]:
+        # Ubicación sin coma: solo provincia, o solo pueblo.
+        # Se ignoran los textos repetidos del título.
+        extras = [t for t in titulos[1:] if sin_acentos(t) != sin_acentos(titulos[0])]
+        for t in extras:
             if sin_acentos(t) in PROVINCIAS_CONOCIDAS:
                 region = t
                 break
+        if not region:
+            for t in extras:
+                if len(t) <= 40 and len(t.split()) <= 5:
+                    ciudad = t
+                    break
     return {
         "id": url.rstrip("/").split("/")[-1],
         "titulo": titulos[0],
@@ -238,6 +274,7 @@ def _normaliza(a_tag, url):
         "region": region.strip(),
         "url": url,
         "edad": edad,
+        "partes": partes,        # texto bruto de la tarjeta (para diagnóstico)
     }
 
 
@@ -267,8 +304,10 @@ def leer_categoria(url, paginas=1):
 # Distancia
 # --------------------------------------------------------------------------
 
-def geocodificar(est, ciudad, region, ctx):
+def geocodificar(est, ciudad, region, ctx, centro, radio):
     """Devuelve (lat, lon), o None si el pueblo no se encuentra.
+    Sin provincia, solo busca dentro de la zona (un cuadro alrededor del
+    centro), para no confundir pueblos que se llaman igual.
     Lanza ErrorGeo si falla la consulta (para reintentar más tarde)."""
     clave = sin_acentos(f"{ciudad}|{region}")
     guardado = est["geo"].get(clave)
@@ -281,13 +320,19 @@ def geocodificar(est, ciudad, region, ctx):
         raise ErrorGeo("límite de consultas alcanzado en esta ejecución")
     ctx["consultas"] += 1
     time.sleep(1.1)   # Nominatim pide como máximo 1 consulta por segundo
+    params = {"format": "json", "limit": 1, "countrycodes": "es"}
+    if region:
+        params["q"] = f"{ciudad}, {region}, España"
+    else:
+        dlat = radio * 1.15 / 111.0
+        dlon = radio * 1.15 / (111.0 * math.cos(math.radians(centro[0])))
+        params["q"] = f"{ciudad}, España"
+        params["viewbox"] = (f"{centro[1] - dlon:.4f},{centro[0] + dlat:.4f},"
+                             f"{centro[1] + dlon:.4f},{centro[0] - dlat:.4f}")
+        params["bounded"] = 1
     try:
-        r = requests.get(
-            NOMINATIM,
-            params={"q": f"{ciudad}, {region}, España", "format": "json",
-                    "limit": 1, "countrycodes": "es"},
-            headers=NOMINATIM_HEADERS, timeout=20,
-        )
+        r = requests.get(NOMINATIM, params=params,
+                         headers=NOMINATIM_HEADERS, timeout=20)
         if r.status_code != 200:
             raise ErrorGeo(f"Nominatim HTTP {r.status_code}")
         datos = r.json()
@@ -318,13 +363,18 @@ def evaluar(a, zona, est, ctx, centro):
             return "fuera", f"provincia excluida ({prov})"
     if a["region"] and candidatas and not provincia_en(a["region"], candidatas):
         return "fuera", f"provincia lejana ({a['region']})"
-    if not a["region"] or not a["ciudad"]:
-        return "dudoso", "solo indica provincia" if a["region"] else "sin ubicación"
-    pos = geocodificar(est, a["ciudad"], a["region"], ctx)
+    radio = zona.get("radio_km", RADIO_DEFECTO)
+    if not a["ciudad"]:
+        if a["region"]:
+            return "dudoso", "solo indica provincia"
+        return "sinubicacion", "el anuncio no indica ubicación"
+    pos = geocodificar(est, a["ciudad"], a["region"], ctx, centro, radio)
     if pos is None:
-        return "dudoso", "no he encontrado el pueblo en el mapa"
+        if a["region"]:
+            return "dudoso", "no he encontrado el pueblo en el mapa"
+        return "fuera", "pueblo sin provincia que no aparece en la zona"
     km = haversine_km(centro[0], centro[1], pos[0], pos[1])
-    if km > zona.get("radio_km", RADIO_DEFECTO):
+    if km > radio:
         return "fuera", f"a {km:.0f} km"
     return "ok", km
 
@@ -348,6 +398,89 @@ def mensaje_aviso(cat, a, veredicto, detalle):
 # Programa principal
 # --------------------------------------------------------------------------
 
+def mensaje_bajada(cat, a, antes, ahora, km, detalle):
+    pct = (antes - ahora) / antes * 100
+    lugar = ", ".join(x for x in (a["ciudad"], a["region"]) if x) or "ubicación no indicada"
+    if km is not None:
+        lugar += f" (a {km:.0f} km)"
+    elif detalle:
+        lugar += f"\nℹ️ Ubicación dudosa: {detalle}"
+    return (
+        f"📉 <b>[{html.escape(cat['nombre'])}] Bajada de precio</b> {html.escape(a['titulo'])}\n"
+        f"💶 {formatea_precio(antes)} → <b>{formatea_precio(ahora)}</b> (−{pct:.0f} %)\n"
+        f"📍 {html.escape(lugar)}\n"
+        f"{html.escape(a['url'])}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Estadísticas
+# --------------------------------------------------------------------------
+
+def _resumen_precios(items, minimo):
+    precios = [h["p"] for h in items if h.get("p") is not None and h["p"] >= minimo]
+    if not precios:
+        return None
+    return statistics.median(precios), min(precios), max(precios)
+
+
+def texto_resumen(est, categorias, desde, hasta, titulo, minimo, comparar=None):
+    """Resumen de los anuncios avisados entre dos fechas (YYYY-MM-DD, ambas incluidas).
+    `comparar` = (desde, hasta) del periodo anterior, para mostrar la variación."""
+    def en(h, a, b):
+        return a <= h["d"] <= b
+    actual = [h for h in est["historial"] if en(h, desde, hasta)]
+    previo = [h for h in est["historial"] if comparar and en(h, *comparar)]
+    n_bajadas = sum(1 for d in est["bajadas"] if desde <= d <= hasta)
+
+    lineas = [f"📊 <b>{titulo}</b>"]
+    if not actual:
+        lineas.append("No ha habido anuncios nuevos en tu zona.")
+    for cat in categorias:
+        nombre = cat["nombre"]
+        mios = [h for h in actual if h["c"] == nombre]
+        if not mios:
+            continue
+        linea = f"• {html.escape(nombre)}: {len(mios)} nuevos"
+        if comparar is not None:
+            antes = len([h for h in previo if h["c"] == nombre])
+            linea += f" ({len(mios) - antes:+d} vs semana anterior)"
+        st = _resumen_precios(mios, minimo)
+        if st:
+            linea += (f" · precio mediano {formatea_precio(st[0])} "
+                      f"(de {formatea_precio(st[1])} a {formatea_precio(st[2])})")
+            if comparar is not None:
+                st0 = _resumen_precios([h for h in previo if h["c"] == nombre], minimo)
+                if st0:
+                    linea += f" · semana anterior {formatea_precio(st0[0])}"
+        lineas.append(linea)
+    lineas.append(f"Total: {len(actual)} nuevos · "
+                  f"{n_bajadas} {'bajada' if n_bajadas == 1 else 'bajadas'} de precio")
+    if minimo > 0:
+        lineas.append(f"<i>Los precios de menos de {minimo:g} € no cuentan en las medias.</i>")
+    return "\n".join(lineas)
+
+
+def enviar_resumenes(est, cfg, categorias):
+    """Envía el resumen diario (y el semanal los domingos) a la hora indicada."""
+    rcfg = cfg.get("resumen", {}) or {}
+    ahora = ahora_madrid()
+    if ahora.hour < rcfg.get("hora", 21):
+        return
+    minimo = rcfg.get("precio_minimo", 5)
+    hoy = ahora.strftime("%Y-%m-%d")
+    if rcfg.get("diario", True) and est["resumen"].get("diario") != hoy:
+        telegram(texto_resumen(est, categorias, hoy, hoy, "Resumen de hoy", minimo))
+        est["resumen"]["diario"] = hoy
+    semana = ahora.strftime("%G-W%V")
+    if (rcfg.get("semanal", True) and ahora.weekday() == 6
+            and est["resumen"].get("semanal") != semana):
+        d = lambda n: (ahora - timedelta(days=n)).strftime("%Y-%m-%d")  # noqa: E731
+        telegram(texto_resumen(est, categorias, d(6), hoy, "Resumen de la semana", minimo,
+                               comparar=(d(13), d(7))))
+        est["resumen"]["semanal"] = semana
+
+
 def main():
     probar = "--probar" in sys.argv
     cfg = cargar_config()
@@ -365,7 +498,11 @@ def main():
     inicializadas = []
     n_marcados = 0
     vistos_ahora = set()
+    bajadas = []             # (categoria, anuncio, precio_antes, precio_ahora, km, detalle)
+    bcfg = cfg.get("bajadas_precio", {}) or {}
+    paginas_defecto = cfg.get("paginas_por_defecto", 1)
     dudosos_permitidos = zona.get("avisar_ubicacion_dudosa", True)
+    sin_ubic_permitidos = zona.get("avisar_sin_ubicacion", False)
 
     for cat in categorias:
         nombre, url = cat.get("nombre"), cat.get("url")
@@ -374,7 +511,7 @@ def main():
             continue
         clave = f"ruralpop|{nombre}"
         try:
-            anuncios = leer_categoria(url, cat.get("paginas", 1))
+            anuncios = leer_categoria(url, cat.get("paginas", paginas_defecto))
         except Exception as e:  # noqa: BLE001
             log(f"[{nombre}] error: {e}")
             if not probar:
@@ -399,11 +536,14 @@ def main():
                 try:
                     v, d = evaluar(a, zona, est, ctx, centro)
                     res = (f"DENTRO, a {d:.0f} km" if v == "ok"
-                           else ("DUDOSO: " if v == "dudoso" else "DESCARTADO: ") + d)
+                           else {"dudoso": "DUDOSO: ", "sinubicacion": "SIN UBICACIÓN: "
+                                 }.get(v, "DESCARTADO: ") + d)
                 except ErrorGeo as e:
-                    res = f"(sin calcular: {e})"
+                    v, res = "?", f"(sin calcular: {e})"
                 log(f"- {a['titulo'][:40]!r} | {formatea_precio(a['precio'])} | "
                     f"{a['ciudad']}, {a['region']} | {res}")
+                if v == "sinubicacion":
+                    log(f"    texto de la tarjeta: {a['partes']}")
             time.sleep(random.uniform(1, 2))
             continue
 
@@ -411,7 +551,7 @@ def main():
         if clave not in est["listos"]:
             for a in anuncios:
                 if a["id"] not in vistos:
-                    vistos[a["id"]] = time.time()
+                    vistos[a["id"]] = {"t": time.time(), "p": a["precio"], "d": None, "k": None}
                     n_marcados += 1
             est["listos"].append(clave)
             inicializadas.append(nombre)
@@ -422,18 +562,56 @@ def main():
         # ---- Revisión normal
         nuevos = 0
         for a in anuncios:
-            if a["id"] in vistos or a["id"] in vistos_ahora:
+            if a["id"] in vistos_ahora:
                 continue
+            reg = registro(vistos, a["id"])
+
+            # --- Anuncio ya visto: ¿ha bajado de precio?
+            if reg is not None:
+                nuevo = a["precio"]
+                viejo = reg.get("p")
+                reg["t"] = time.time()
+                if (bcfg.get("activa", True) and nuevo is not None and viejo is not None
+                        and reg.get("d") != 0
+                        and viejo >= bcfg.get("precio_anterior_minimo", 20)
+                        and nuevo < viejo
+                        and (viejo - nuevo) / viejo * 100 >= bcfg.get("minimo_porcentaje", 10)):
+                    try:
+                        if reg.get("d") is None:       # visto al activar: aún sin medir
+                            v, d = evaluar(a, zona, est, ctx, centro)
+                            dentro = v == "ok" or (v == "dudoso" and dudosos_permitidos)
+                            reg["d"] = 1 if dentro else 0
+                            reg["k"] = d if v == "ok" else None
+                    except ErrorGeo as e:
+                        log(f"[{nombre}] bajada de '{a['titulo'][:30]}' se mirará más tarde ({e})")
+                        continue                        # no se actualiza el precio
+                    if reg["d"] == 1:
+                        detalle = "" if reg.get("k") is not None else "no se pudo calcular la distancia"
+                        bajadas.append((cat, a, viejo, nuevo, reg.get("k"), detalle))
+                if nuevo is not None:
+                    reg["p"] = nuevo
+                vistos_ahora.add(a["id"])
+                continue
+
+            # --- Anuncio nuevo
             try:
                 v, d = evaluar(a, zona, est, ctx, centro)
             except ErrorGeo as e:
                 log(f"[{nombre}] '{a['titulo'][:30]}' se reintentará más tarde ({e})")
                 continue                    # no se marca como visto
-            vistos[a["id"]] = time.time()   # se recuerda aunque se descarte
             vistos_ahora.add(a["id"])
-            if v == "fuera" or (v == "dudoso" and not dudosos_permitidos):
-                continue
+            avisar = not (v == "fuera"
+                          or (v == "dudoso" and not dudosos_permitidos)
+                          or (v == "sinubicacion" and not sin_ubic_permitidos))
+            vistos[a["id"]] = {"t": time.time(), "p": a["precio"],
+                               "d": 1 if avisar else 0, "k": d if v == "ok" else None}
+            if not avisar:
+                continue                    # se recuerda aunque se descarte
+            if v == "sinubicacion":
+                v = "dudoso"
             pendientes.append((cat, a, v, d))
+            est["historial"].append({"id": a["id"], "c": nombre, "p": a["precio"],
+                                     "d": ahora_madrid().strftime("%Y-%m-%d")})
             nuevos += 1
         log(f"[{nombre}] {len(anuncios)} anuncios, {nuevos} nuevos para avisar")
         time.sleep(random.uniform(1, 2.5))
@@ -462,14 +640,27 @@ def main():
         resto = len(pendientes) - MAX_AVISOS_POR_EJECUCION
         if resto > 0:
             telegram(f"… y {resto} anuncios nuevos más. Revisa Ruralpop.")
+        for cat, a, antes, ahora, km, detalle in bajadas[:MAX_AVISOS_POR_EJECUCION]:
+            telegram(mensaje_bajada(cat, a, antes, ahora, km, detalle))
+            est["bajadas"].append(ahora_madrid().strftime("%Y-%m-%d"))
+            time.sleep(0.7)
     except Exception as e:  # noqa: BLE001
         # Si Telegram falla no se guarda el estado: así se reintentará
         log("Error enviando a Telegram:", e)
         sys.exit(1)
 
     guardar_estado(est)
-    log(f"Hecho. Avisos enviados: {min(len(pendientes), MAX_AVISOS_POR_EJECUCION)} "
+    log(f"Hecho. Avisos enviados: {min(len(pendientes), MAX_AVISOS_POR_EJECUCION)} nuevos, "
+        f"{min(len(bajadas), MAX_AVISOS_POR_EJECUCION)} bajadas "
         f"({ctx['consultas']} consultas al mapa)")
+
+    # Resúmenes (no el mismo día de la activación, para no mezclar mensajes)
+    if not inicializadas:
+        try:
+            enviar_resumenes(est, cfg, categorias)
+            guardar_estado(est)
+        except Exception as e:  # noqa: BLE001
+            log("No se pudo enviar el resumen:", e)
 
 
 if __name__ == "__main__":
